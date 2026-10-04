@@ -1,63 +1,76 @@
 # CI/CD AI Agent
 
-An autonomous agent that watches GitHub Actions pipelines, diagnoses failures, and proposes (and validates) code fixes on its own.
+An agent that runs inside GitHub Actions. When CI fails after a push to `main`, it reads the failing job's log, finds the cause, edits the code, re-runs the tests, and opens a pull request with the fix.
 
-When a CI run fails, the agent pulls the failing job's logs and the relevant commit/PR diff, reasons about the root cause with GPT-4o, and generates a targeted patch. Before anything is committed, the patch is applied inside an isolated Docker sandbox and re-run against the original failing check — only a patch that actually turns the build green gets pushed. Every run, decision, and patch is persisted so the agent can recognize a failure it has already fixed before and skip redundant LLM calls.
+The repo contains a small demo app (`billsplit.py` with tests in `test_billsplit.py`). One test is intentionally wrong (`test_split_100_between_4`) so you can watch the agent work.
 
 ## How it works
 
-The agent is a small graph of three cooperating nodes, built with LangGraph:
-
 ```
- GitHub Actions ──(failed run)──▶ Planner ──▶ Tool Executor ──▶ Critic
-                                     ▲                              │
-                                     └──────────(retry, bounded)────┘
-                                                                     │
-                                                          pass ──▶ commit / open PR
-                                                          fail ──▶ report + stop
+push to main ──▶ CI (ci.yml) fails ──▶ CI Fix Agent (agent.yml)
+                                              │
+ gather_context ─▶ planner ⇄ tool_executor ─▶ critic ─┬─ pass ─▶ push branch + open PR
+                      ▲                               ├─ fail, attempts < 3 ─▶ back to planner
+                      └───────────────────────────────┘
+                                                      └─ fail, attempts = 3 ─▶ give up
 ```
 
-- **Planner** — a GPT-4o node that looks at the failure signature, logs, and diff, and decides what to do next: pull more context, or propose a patch.
-- **Tool Executor** — executes whatever the Planner asked for: fetch logs, fetch diff, apply a patch, run tests in the sandbox.
-- **Critic** — takes a proposed patch, applies it in a disposable Docker container, re-runs the failing check, and returns a verdict. A failing verdict loops back to the Planner (up to a retry limit); a passing verdict moves to commit.
+- **gather_context** (plain Python): fetches the failed job's log from the GitHub API, trims it to the pytest failure section, and records the test count.
+- **planner** (Claude Haiku via `langchain-anthropic`): reads the log, uses the tools, and decides whether the bug is in the code or in the test.
+- **tool_executor**: LangGraph `ToolNode` with three tools: `list_files`, `read_file`, `edit_file`. Paths are restricted to the repo.
+- **critic** (plain Python): runs `pytest -v`. It also fails the attempt if the test count dropped, which blocks "delete the failing test". Up to 3 attempts.
+- **push** (plain Python): creates the branch `agent-fix/<run_id>`, commits, pushes, and opens a PR into `main` with the failure log, the explanation and the diff. The PR flags any modified test files.
+- **give_up**: prints what was tried and exits non-zero.
 
-Everything the agent sees and decides — logs, prompts, tool calls, patches, verdicts — is written to PostgreSQL. Before planning, the agent checks whether it has already seen this failure signature before and reuses that memory instead of re-running the LLM from scratch.
+Nothing is pushed to `main` directly. You review and merge the PR.
 
-## Tech stack
+## Setup
 
-| Concern | Choice |
-|---|---|
-| Agent orchestration | LangGraph |
-| Reasoning | GPT-4o |
-| CI integration | GitHub Actions REST/GraphQL API |
-| Patch validation sandbox | Docker (ephemeral containers) |
-| Persistence (runs, patches, memory) | PostgreSQL |
-| Language | Python |
+1. Add a repo secret named `ANTHROPIC_API_KEY` (Settings → Secrets and variables → Actions). Paste the key without quotes.
+2. Enable Settings → Actions → General → Workflow permissions → "Allow GitHub Actions to create and approve pull requests".
+3. Keep `agent.yml` on `main`, since `workflow_run` triggers only work from the default branch. The `name:` in `ci.yml` must stay `CI`.
 
-## Project status
+`GITHUB_TOKEN` is provided automatically. No keys are stored in the code.
 
-Early scaffolding. See [`PLAN.md`](PLAN.md) for the phased build plan and [`docs/architecture.md`](docs/architecture.md) for the current design notes.
+## Running it
+
+- **Automatic:** push a commit to `main` that breaks CI. The "CI Fix Agent" workflow starts when CI completes and opens a PR.
+- **Manual:** Actions → "CI Fix Agent" → Run workflow. Enter the `run_id` of a failed CI run (the number in its URL).
+  - `dry_run` on (default): runs the full pipeline but only prints the diff. No branch, no PR.
+  - `dry_run` off: pushes the branch and opens the PR.
+  - Automatic runs are never dry.
+
+Each run uploads an `agent-debug` artifact with the node-by-node log and the final diff.
 
 ## Project layout
 
 ```
-ci_cd_agent/
-├── agent/          # LangGraph graph definition + Planner/Executor/Critic nodes
-├── tools/          # GitHub API, log/diff retrieval, Docker sandbox, patch apply
-├── db/             # SQLAlchemy models, migrations, memory lookup
-├── api/            # Webhook/polling entrypoint that triggers agent runs
-├── sandbox/        # Dockerfile for the disposable validation container
-├── tests/          # Unit + integration tests, seeded failing repos
-docker-compose.yml
-requirements.txt
-.env.example
+billsplit.py            # demo app
+test_billsplit.py       # demo tests (one intentionally wrong)
+requirements.txt        # app requirements
+ci-agent-plan.md        # design and build plan
+.github/workflows/
+  ci.yml                # runs pytest on push / PR
+  agent.yml             # runs the agent when CI fails
+agent/
+  requirements.txt      # langgraph, langchain-core, langchain-anthropic, requests
+  main.py               # entry point
+  state.py              # graph state
+  tools.py              # list_files, read_file, edit_file
+  nodes.py              # gather_context, planner, critic, push, give_up
+  graph.py              # wires nodes and edges
 ```
 
-## Getting started
+## Known limitations
 
-```bash
-cp .env.example .env   # fill in GITHUB_TOKEN, OPENAI_API_KEY, DB credentials
-docker-compose up --build
-```
+- CI does not run on the agent's PR, because PRs opened with `GITHUB_TOKEN` don't trigger workflows. The critic's local pytest run is the only check before you merge.
+- The test-count guard doesn't catch weakened tests (`skip`, `xfail`, changed expected values). Review the PR diff.
+- Handles only pushes to `main`. No feature-branch or fork support.
+- The failure log is untrusted input to the LLM, and the critic runs pytest with secrets in its environment.
 
-This brings up PostgreSQL, the sandbox runner, and the agent service. See `.env.example` for required configuration.
+## Possible later additions
+
+- Run the critic in a Docker container with no network and no secrets.
+- PostgreSQL for LangGraph checkpoints, patch history and success-rate metrics.
+- A benchmark set of intentionally broken commits to measure the success rate.
+- A PAT or GitHub App token so CI runs on the agent's PR (this needs a loop guard).
