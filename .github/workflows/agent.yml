@@ -34,8 +34,9 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
-      DEBUG_FILE: ${{ runner.temp }}/agent_debug.txt
     steps:
+      - name: Set debug file path
+        run: echo "DEBUG_FILE=$RUNNER_TEMP/agent_debug.txt" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || '' }}
