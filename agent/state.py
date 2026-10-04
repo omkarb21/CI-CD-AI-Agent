@@ -1,22 +1,15 @@
-"""Shared state passed between LangGraph nodes."""
+from typing import Annotated, TypedDict
 
-from typing import Literal, TypedDict
+from langgraph.graph.message import add_messages
 
 
-class AgentState(TypedDict, total=False):
+class State(TypedDict, total=False):
+    run_id: str
     repo: str
-    commit_sha: str
-    job_name: str
-    log_excerpt: str
-    diff_context: str
-    error_signature: str
-
-    planner_reasoning: str
-    next_action: Literal["gather_context", "propose_patch", "commit", "give_up"]
-
-    candidate_patch: str
-    critic_verdict: Literal["pass", "fail"]
-    critic_notes: str
-
-    iteration: int
-    max_iterations: int
+    failure_log: str
+    messages: Annotated[list, add_messages]
+    test_count_before: int
+    critic_feedback: str
+    attempts: int
+    explanation: str
+    status: str  # "fixed" | "gave_up"
