@@ -18,5 +18,5 @@ def test_split_evenly_with_leftover():
 
 
 def test_split_100_between_4():
-    # Intentionally wrong: 100 split 4 ways is 25 each, not 30.
-    assert split_evenly(100, 4) == [30, 30, 30, 30]
+    # 100 split 4 ways is 25 each
+    assert split_evenly(100, 4) == [25, 25, 25, 25]
